@@ -2,6 +2,7 @@
 # under the Apache License Version 2.0, see <https://www.apache.org/licenses/>
 
 import logging
+import pickle
 import random
 import warnings
 from math import pi
@@ -34,6 +35,41 @@ from torch.distributions import (
 from torch.optim.adam import Adam
 
 from sbi.sbi_types import TorchTransform
+
+
+class CPU_Unpickler(pickle.Unpickler):
+    """A :class:`pickle.Unpickler` that restores tensors and storages on CPU.
+
+    PyTorch embeds the device a storage was created on in the pickle stream, so loading
+    a file saved on GPU raises an error on a host without that device. This unpickler
+    rebinds the helpers that create storages and tensors so they are always restored on
+    CPU. Loading a file that was saved on CPU is a no-op; loading one saved on another
+    device moves the tensors to CPU. Tensors on the requested device are preserved.
+    """
+
+    _STORAGE_HELPERS = {"_load_from_bytes"}
+    _TENSOR_HELPERS = {
+        "_rebuild_tensor",
+        "_rebuild_tensor_v2",
+        "_rebuild_tensor_v3",
+        "_rebuild_parameter",
+        "_rebuild_parameter_with_state",
+    }
+
+    def find_class(self, module: str, name: str):
+        func = super().find_class(module, name)
+        if module == "torch.storage" and name in self._STORAGE_HELPERS:
+            return lambda data: func(data).cpu()
+        if module == "torch._utils" and name in self._TENSOR_HELPERS:
+            return lambda *args, **kwargs: func(*args, **kwargs).cpu()
+        if (
+            module == "torch._utils"
+            and name == "_rebuild_device_tensor_from_cpu_tensor"
+        ):
+            return lambda data, dtype, device, requires_grad: func(
+                data, dtype, "cpu", requires_grad
+            )
+        return func
 
 
 def warn_if_invalid_for_zscoring(
