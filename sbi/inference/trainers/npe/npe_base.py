@@ -165,15 +165,8 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         self._proposal_roundwise = []
         self.use_non_atomic_loss = False
 
-        # Per-sample fidelity level of every appended batch, kept parallel to
-        # `_theta_roundwise` and friends. Lower values are expected to be cheaper to
-        # simulate than higher ones; nothing in sbi interprets them, they only let
-        # `train(fidelity=...)` select the data of one level (see `append_simulations`).
         self._fidelity_roundwise = []
-        # Fidelity level that `train()` is currently restricted to, see `train`.
         self._active_fidelity: Optional[int] = None
-        # Multifidelity bookkeeping, filled in by `train`. Declared here so that the
-        # `summary` property has the same keys for every member of the NPE family.
         self._summary["fidelity_counts"] = {}
         self._summary["trained_fidelity"] = None
 
@@ -192,8 +185,6 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
                 torch.zeros(theta.shape[0], dtype=torch.long, device=theta.device)
                 for theta in state_dict["_theta_roundwise"]
             ]
-        # A trainer is never mid-`train()` once it has been pickled, so no level is
-        # active. Guarded because objects saved without the attribute predate it.
         state_dict.setdefault("_active_fidelity", None)
         summary = state_dict["_summary"]
         summary.setdefault("fidelity_counts", {})
@@ -502,18 +493,8 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
                     f"Pass fidelity=None to train on all appended simulations."
                 )
 
-        # A fidelity-filtered call is the transfer-learning path: warm-starting a
-        # network that was pre-trained on coarser simulations. Data drawn from the prior
-        # (or from a restricted prior covering the posterior support, as in TSNPE)
-        # is tagged as round 0 and is fitted with the maximum-likelihood loss, which
-        # is what the fine-tuning stage of MF-NPE does. Only infer this when the
-        # caller did not express a preference, and only while no proposal correction
-        # is involved.
         current_round = max(self._data_round_index)
         if resume_training and fidelity is not None:
-            # Resuming keeps the train/validation indices of the previous call, but
-            # those index the unfiltered dataset and would silently select the
-            # wrong rows once a fidelity filter shrinks it.
             raise ValueError(
                 "resume_training=True cannot be combined with fidelity="
                 f"{fidelity}: resuming reuses the train/validation split of "
@@ -559,10 +540,6 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         # last proposal.
         proposal = self._proposal_roundwise[-1]
 
-        # `get_simulations`, and hence the dataloaders and the network
-        # initialization below, restrict themselves to this fidelity level while
-        # it is set. It has to be set before the dataloaders are built, so that
-        # they and the train/validation indices come from the selected data.
         self._active_fidelity = fidelity
         try:
             train_loader, val_loader = self.get_dataloaders(
@@ -593,8 +570,6 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         finally:
             self._active_fidelity = None
 
-        # How many simulations each level contributed to this call. For multifidelity
-        # inference this is the expensive number that the method is usually judged on.
         self._summary["fidelity_counts"] = self.get_fidelity_counts()
         self._summary["trained_fidelity"] = fidelity
 

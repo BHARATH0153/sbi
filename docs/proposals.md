@@ -20,6 +20,7 @@ This page serves as an entry point to all EPs and explains how they are organize
 
 - [EP-00: Enhancement Proposal Process](proposals/ep-00-process.md)
 - [EP-01: Pluggable Training Infrastructure for sbi](proposals/ep-01-pluggable-training.md)
+- [EP-02: Multi-Fidelity NPE via Fidelity Provenance Tags](proposals/ep-02-multifidelity-npe.md)
 
 If you would like to propose a new EP, open a discussion and a PR adding a new
 `proposals/ep-XX-<short-title>.md` file.
