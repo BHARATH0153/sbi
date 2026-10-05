@@ -138,12 +138,13 @@ class NPE_C(PosteriorEstimatorTrainer):
         clip_max_norm: Optional[float] = 5.0,
         calibration_kernel: Optional[Callable] = None,
         resume_training: bool = False,
-        force_first_round_loss: bool = False,
+        force_first_round_loss: Optional[bool] = None,
         discard_prior_samples: bool = False,
         use_combined_loss: bool = False,
         retrain_from_scratch: bool = False,
         show_train_summary: bool = False,
         dataloader_kwargs: Optional[Dict] = None,
+        fidelity: Optional[int] = None,
     ) -> ConditionalDensityEstimator:
         r"""Return density estimator that approximates the distribution $p(\theta|x)$.
 
@@ -168,7 +169,11 @@ class NPE_C(PosteriorEstimatorTrainer):
                 be restored from the last time ``.train()`` was called.
             force_first_round_loss: If ``True``, train with maximum likelihood,
                 i.e., potentially ignoring the correction for using a proposal
-                distribution different from the prior.
+                distribution different from the prior. If ``None``, this is inferred
+                from ``fidelity``: a fidelity-filtered call on round-0 data (prior or
+                restricted-prior samples, as in the pre-training and fine-tuning
+                stages of multifidelity NPE) uses the maximum-likelihood loss, and any
+                other call does not. Pass ``True`` or ``False`` to decide explicitly.
             discard_prior_samples: Whether to discard samples simulated in round 1, i.e.
                 from the prior. Training may be sped up by ignoring such less targeted
                 samples.
@@ -182,6 +187,12 @@ class NPE_C(PosteriorEstimatorTrainer):
                 loss and leakage after the training.
             dataloader_kwargs: Additional or updated kwargs to be passed to the training
                 and validation dataloaders (like, e.g., a collate_fn)
+            fidelity: If not ``None``, only train on the simulations appended with
+                this fidelity level (see
+                :meth:`~sbi.inference.trainers.npe.PosteriorEstimatorTrainer.append_simulations`),
+                warm-starting the network from whatever level was trained before. This
+                is how multifidelity NPE refines a network pre-trained on cheaper
+                simulations. If ``None``, all appended simulations are used.
 
         Returns:
             Density estimator that approximates the distribution $p(\theta|x)$.

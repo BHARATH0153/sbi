@@ -16,7 +16,8 @@ from typing import (
     Union,
 )
 
-from torch import Tensor, ones
+import torch
+from torch import Tensor, full, ones
 from torch.distributions import Distribution
 from torch.utils.tensorboard.writer import SummaryWriter
 from typing_extensions import Self
@@ -69,9 +70,11 @@ from sbi.utils import (
 )
 from sbi.utils.sbiutils import (
     ImproperEmpirical,
+    get_simulations_since_round,
     mask_sims_from_prior,
 )
 from sbi.utils.torchutils import assert_all_finite
+from sbi.utils.typechecks import validate_nonnegative_int
 
 
 class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], ABC):
@@ -162,6 +165,41 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         self._proposal_roundwise = []
         self.use_non_atomic_loss = False
 
+        # Per-sample fidelity level of every appended batch, kept parallel to
+        # `_theta_roundwise` and friends. Lower values are expected to be cheaper to
+        # simulate than higher ones; nothing in sbi interprets them, they only let
+        # `train(fidelity=...)` select the data of one level (see `append_simulations`).
+        self._fidelity_roundwise = []
+        # Fidelity level that `train()` is currently restricted to, see `train`.
+        self._active_fidelity: Optional[int] = None
+        # Multifidelity bookkeeping, filled in by `train`. Declared here so that the
+        # `summary` property has the same keys for every member of the NPE family.
+        self._summary["fidelity_counts"] = {}
+        self._summary["trained_fidelity"] = None
+
+    def __setstate__(self, state_dict: Dict):
+        """Sets the state when being loaded from pickle.
+
+        Also restores the fidelity bookkeeping for objects that were pickled before the
+        `fidelity` argument of `append_simulations` existed. Their stored simulations
+        were all single-fidelity, so every one of them gets level 0.
+
+        Args:
+            state_dict: State to be restored.
+        """
+        if "_fidelity_roundwise" not in state_dict:
+            state_dict["_fidelity_roundwise"] = [
+                torch.zeros(theta.shape[0], dtype=torch.long, device=theta.device)
+                for theta in state_dict["_theta_roundwise"]
+            ]
+        # A trainer is never mid-`train()` once it has been pickled, so no level is
+        # active. Guarded because objects saved without the attribute predate it.
+        state_dict.setdefault("_active_fidelity", None)
+        summary = state_dict["_summary"]
+        summary.setdefault("fidelity_counts", {})
+        summary.setdefault("trained_fidelity", None)
+        super().__setstate__(state_dict)
+
     @abstractmethod
     def _log_prob_proposal_posterior(
         self,
@@ -192,6 +230,7 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         proposal: Optional[DirectPosterior] = None,
         exclude_invalid_x: Optional[bool] = None,
         data_device: Optional[str] = None,
+        fidelity: int = 0,
     ) -> Self:
         r"""Store parameters and simulation outputs to use them for later training.
 
@@ -216,10 +255,20 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
             data_device: Where to store the data, default is on the same device where
                 the training is happening. If training a large dataset on a GPU with not
                 much VRAM can set to 'cpu' to store data on system memory instead.
+            fidelity: Non-negative integer labelling the fidelity level of these
+                simulations, for instance `0` for a cheap low-fidelity simulator and `1`
+                for an expensive high-fidelity one. The label is stored alongside the
+                data and only carries provenance; it is what `train(fidelity=...)`
+                selects on, which allows training on the high-fidelity data only after
+                having pre-trained on the low-fidelity data (see `train` and the
+                multifidelity example in `NPE_C`). All levels must produce the same
+                shape of `x`, because a single density estimator is fit across them.
 
         Returns:
             NeuralInference object (returned so that this function is chainable).
         """
+        validate_nonnegative_int(fidelity, "fidelity")
+
         if (
             proposal is None
             or proposal is self._prior
@@ -270,6 +319,7 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
             npe_msg_on_invalid_x(num_nans, num_infs, exclude_invalid_x, algorithm)
 
         self._check_proposal(proposal)
+        self._check_fidelity_x_shape(x, fidelity)
 
         self._data_round_index.append(current_round)
         prior_masks = mask_sims_from_prior(int(current_round > 0), theta.size(0))
@@ -277,6 +327,9 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         self._theta_roundwise.append(theta)
         self._x_roundwise.append(x)
         self._prior_masks.append(prior_masks)
+        self._fidelity_roundwise.append(
+            full((theta.size(0),), fidelity, dtype=torch.long, device=theta.device)
+        )
 
         self._proposal_roundwise.append(proposal)
 
@@ -298,6 +351,75 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
 
         return self
 
+    def _check_fidelity_x_shape(self, x: Tensor, fidelity: int) -> None:
+        """Ensure `x` matches the event shape of the simulations stored so far.
+
+        One density estimator is fit across all fidelity levels, and its condition shape
+        is fixed when the network is built from the first batch. A level producing a
+        different event shape would therefore fail much later, during training, so it is
+        rejected when the data is appended.
+
+        Args:
+            x: Simulation outputs about to be appended.
+            fidelity: The fidelity label passed to `append_simulations`.
+
+        Raises:
+            ValueError: If the event shape of `x` differs from the stored simulations.
+        """
+        if not self._x_roundwise:
+            return
+
+        stored_shape = tuple(self._x_roundwise[0].shape[1:])
+        if tuple(x.shape[1:]) != stored_shape:
+            raise ValueError(
+                f"All fidelity levels must produce simulations of the same shape, "
+                f"because a single density estimator is trained across them. "
+                f"Simulations appended first have event shape {stored_shape}, but the "
+                f"ones appended with fidelity={fidelity} have event shape "
+                f"{tuple(x.shape[1:])}. Use a shared summary statistic or "
+                f"embedding net for the simulators if they differ."
+            )
+
+    def _fidelity_mask(self, starting_round: int = 0) -> Tensor:
+        """Return a mask selecting `_active_fidelity` from the stored simulations.
+
+        Args:
+            starting_round: The earliest round to take samples into account.
+
+        Returns:
+            Boolean tensor with one entry per returned simulation, `True` where the
+            simulation was appended with `fidelity == _active_fidelity`.
+        """
+        fidelities = get_simulations_since_round(
+            self._fidelity_roundwise, self._data_round_index, starting_round
+        )
+        return fidelities == self._active_fidelity
+
+    def get_simulations(
+        self,
+        starting_round: int = 0,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        r"""Returns all $\theta$, $x$, and prior_masks from rounds >= `starting_round`.
+
+        While `train()` is running, this returns only the simulations of the fidelity
+        level passed to `train(fidelity=...)`, so that the dataloaders and the network
+        initialization see exactly the data that is being trained on. Outside of
+        `train()` all appended simulations are returned.
+
+        Args:
+            starting_round: The earliest round to return samples from (we start counting
+                from zero).
+
+        Returns: Parameters, simulation outputs, prior masks.
+        """
+        theta, x, prior_masks = super().get_simulations(starting_round)
+
+        if self._active_fidelity is None:
+            return theta, x, prior_masks
+
+        mask = self._fidelity_mask(starting_round)
+        return theta[mask], x[mask], prior_masks[mask]
+
     def train(
         self,
         training_batch_size: int = 200,
@@ -308,11 +430,12 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         clip_max_norm: Optional[float] = 5.0,
         calibration_kernel: Optional[Callable] = None,
         resume_training: bool = False,
-        force_first_round_loss: bool = False,
+        force_first_round_loss: Optional[bool] = None,
         discard_prior_samples: bool = False,
         retrain_from_scratch: bool = False,
         show_train_summary: bool = False,
         dataloader_kwargs: Optional[dict] = None,
+        fidelity: Optional[int] = None,
     ) -> ConditionalDensityEstimator:
         r"""Return density estimator that approximates the distribution $p(\theta|x)$.
 
@@ -336,7 +459,11 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
                 be restored from the last time `.train()` was called.
             force_first_round_loss: If `True`, train with maximum likelihood,
                 i.e., potentially ignoring the correction for using a proposal
-                distribution different from the prior.
+                distribution different from the prior. If `None`, this is inferred
+                from `fidelity`: a fidelity-filtered call on round-0 data (prior or
+                restricted-prior samples, as in the pre-training and fine-tuning stages
+                of multi-fidelity NPE) uses the maximum-likelihood loss, and any other
+                call does not. Pass `True` or `False` to decide explicitly.
             discard_prior_samples: Whether to discard samples simulated in round 1, i.e.
                 from the prior. Training may be sped up by ignoring such less targeted
                 samples.
@@ -346,6 +473,14 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
                 loss after the training.
             dataloader_kwargs: Additional or updated kwargs to be passed to the training
                 and validation dataloaders (like, e.g., a collate_fn)
+            fidelity: If not `None`, only train on the simulations appended with this
+                fidelity level (see `append_simulations`), ignoring every other level.
+                Because the network is warm-started rather than rebuilt, passing a
+                fidelity level here is how multi-fidelity NPE refines a network that was
+                pre-trained on cheaper simulations. For instance, pre-train on
+                low-fidelity data appended with `fidelity=0`, then append expensive data
+                with `fidelity=1` and call `train(fidelity=1)`. If `None`, all appended
+                simulations are used, which is single-fidelity behaviour.
 
         Returns:
             Density estimator that approximates the distribution $p(\theta|x)$.
@@ -356,6 +491,39 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
                 "No simulations found. You must call .append_simulations() "
                 "before calling .train()."
             )
+
+        if fidelity is not None:
+            validate_nonnegative_int(fidelity, "fidelity")
+            known_fidelities = self.get_fidelity_counts()
+            if fidelity not in known_fidelities:
+                raise ValueError(
+                    f"No simulations were appended with fidelity={fidelity}. "
+                    f"Available fidelity levels are {sorted(known_fidelities)}. "
+                    f"Pass fidelity=None to train on all appended simulations."
+                )
+
+        # A fidelity-filtered call is the transfer-learning path: warm-starting a
+        # network that was pre-trained on coarser simulations. Data drawn from the prior
+        # (or from a restricted prior covering the posterior support, as in TSNPE)
+        # is tagged as round 0 and is fitted with the maximum-likelihood loss, which
+        # is what the fine-tuning stage of MF-NPE does. Only infer this when the
+        # caller did not express a preference, and only while no proposal correction
+        # is involved.
+        current_round = max(self._data_round_index)
+        if resume_training and fidelity is not None:
+            # Resuming keeps the train/validation indices of the previous call, but
+            # those index the unfiltered dataset and would silently select the
+            # wrong rows once a fidelity filter shrinks it.
+            raise ValueError(
+                "resume_training=True cannot be combined with fidelity="
+                f"{fidelity}: resuming reuses the train/validation split of "
+                "the previous call, which was computed over all fidelities. "
+                "Use resume_training=False to re-split the selected fidelity "
+                "level."
+            )
+
+        if force_first_round_loss is None:
+            force_first_round_loss = fidelity is not None and current_round == 0
 
         train_config = TrainConfig(
             max_num_epochs=max_num_epochs,
@@ -391,31 +559,66 @@ class PosteriorEstimatorTrainer(NeuralInference[ConditionalDensityEstimator], AB
         # last proposal.
         proposal = self._proposal_roundwise[-1]
 
-        train_loader, val_loader = self.get_dataloaders(
-            start_idx,
-            train_config.training_batch_size,
-            train_config.validation_fraction,
-            train_config.resume_training,
-            dataloader_kwargs=dataloader_kwargs,
-        )
+        # `get_simulations`, and hence the dataloaders and the network
+        # initialization below, restrict themselves to this fidelity level while
+        # it is set. It has to be set before the dataloaders are built, so that
+        # they and the train/validation indices come from the selected data.
+        self._active_fidelity = fidelity
+        try:
+            train_loader, val_loader = self.get_dataloaders(
+                start_idx,
+                train_config.training_batch_size,
+                train_config.validation_fraction,
+                train_config.resume_training,
+                dataloader_kwargs=dataloader_kwargs,
+            )
 
-        self._initialize_neural_network(
-            retrain_from_scratch=train_config.retrain_from_scratch,
-            start_idx=start_idx,
-        )
+            self._initialize_neural_network(
+                retrain_from_scratch=train_config.retrain_from_scratch,
+                start_idx=start_idx,
+            )
 
-        loss_args = LossArgsNPE(
-            proposal=proposal,
-            calibration_kernel=calibration_kernel,
-            force_first_round_loss=force_first_round_loss,
-        )
+            loss_args = LossArgsNPE(
+                proposal=proposal,
+                calibration_kernel=calibration_kernel,
+                force_first_round_loss=force_first_round_loss,
+            )
 
-        return self._run_training_loop(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            train_config=train_config,
-            loss_args=loss_args,
-        )
+            density_estimator = self._run_training_loop(
+                train_loader=train_loader,
+                val_loader=val_loader,
+                train_config=train_config,
+                loss_args=loss_args,
+            )
+        finally:
+            self._active_fidelity = None
+
+        # How many simulations each level contributed to this call. For multifidelity
+        # inference this is the expensive number that the method is usually judged on.
+        self._summary["fidelity_counts"] = self.get_fidelity_counts()
+        self._summary["trained_fidelity"] = fidelity
+
+        return density_estimator
+
+    def get_fidelity_counts(self) -> Dict[int, int]:
+        """Return the number of stored simulations per fidelity level.
+
+        Levels with no simulations are omitted, so the returned keys are exactly the
+        levels that have been passed to `append_simulations`.
+
+        Returns:
+            Mapping from fidelity level to the number of simulations appended with it.
+        """
+        if not self._fidelity_roundwise:
+            return {}
+
+        fidelities = torch.cat(self._fidelity_roundwise)
+        return {
+            int(level): int(count)
+            for level, count in zip(
+                *torch.unique(fidelities, return_counts=True), strict=True
+            )
+        }
 
     def build_posterior(
         self,

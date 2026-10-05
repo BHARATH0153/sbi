@@ -70,6 +70,18 @@ def validate_positive_int(x: Any, field_name: str) -> None:
         raise ValueError(f"Expected positive integer for {field_name} but got {x}.")
 
 
+def validate_nonnegative_int(x: Any, field_name: str) -> None:
+    """Validate x is a non-negative integer."""
+
+    if not is_int(x):
+        raise TypeError(
+            f"Expected a non-negative integer for {field_name} but got"
+            f" type {type(x).__name__} with value {x}."
+        )
+    if x < 0:
+        raise ValueError(f"Expected non-negative integer for {field_name} but got {x}.")
+
+
 def validate_positive_float(x: Any, field_name: str) -> None:
     """Validate x is a positive floating point number."""
 

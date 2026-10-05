@@ -143,6 +143,7 @@ class MNPE(NPE_C):
         retrain_from_scratch: bool = False,
         show_train_summary: bool = False,
         dataloader_kwargs: Optional[Dict] = None,
+        fidelity: Optional[int] = None,
     ) -> MixedDensityEstimator:
         density_estimator = super().train(
             **del_entries(locals(), entries=("self", "__class__"))

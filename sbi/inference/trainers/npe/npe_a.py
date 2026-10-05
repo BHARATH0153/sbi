@@ -200,6 +200,7 @@ class NPE_A(PosteriorEstimatorTrainer):
         retrain_from_scratch: bool = False,
         show_train_summary: bool = False,
         dataloader_kwargs: Optional[Dict] = None,
+        fidelity: Optional[int] = None,
     ) -> ConditionalDensityEstimator:
         r"""Return density estimator that approximates the proposal posterior.
 
@@ -234,6 +235,11 @@ class NPE_A(PosteriorEstimatorTrainer):
                 loss and leakage after the training.
             dataloader_kwargs: Additional or updated kwargs to be passed to the training
                 and validation dataloaders (like, e.g., a collate_fn)
+            fidelity: If not `None`, only train on the simulations appended with this
+                fidelity level (see
+                `PosteriorEstimatorTrainer.append_simulations`). Note that NPE-A
+                rejects `retrain_from_scratch`, so multi-fidelity pre-training is only
+                possible with `NPE_C`.
 
         Returns:
             Density estimator that approximates the distribution $p(\theta|x)$.
